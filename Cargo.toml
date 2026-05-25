@@ -2,21 +2,12 @@
 name = "llm-pii-redact"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+description = "Reversible PII redaction for LLM prompts"
 license = "MIT"
-description = "Regex-based PII redaction for LLM prompts and tool outputs, with reversible placeholders."
-authors = ["Mukunda Rao Katta <mukunda.vjcs6@gmail.com>"]
 repository = "https://github.com/MukundaKatta/llm-pii-redact-rs"
-homepage = "https://github.com/MukundaKatta/llm-pii-redact-rs"
-documentation = "https://docs.rs/llm-pii-redact"
-readme = "README.md"
-keywords = ["llm", "pii", "redact", "ai", "privacy"]
-categories = ["text-processing", "api-bindings"]
-exclude = [".github/*", "target/*"]
+keywords = ["pii", "redaction", "llm", "privacy", "regex"]
+categories = ["text-processing"]
+exclude = ["target/*", ".github/*", "*.log"]
 
 [dependencies]
 regex = "1"
-serde = { version = "1", optional = true, features = ["derive"] }
-
-[features]
-serde = ["dep:serde"]

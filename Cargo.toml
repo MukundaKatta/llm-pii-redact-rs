@@ -11,3 +11,8 @@ exclude = ["target/*", ".github/*", "*.log"]
 
 [dependencies]
 regex = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

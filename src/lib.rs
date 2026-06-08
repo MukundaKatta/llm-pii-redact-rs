@@ -1,30 +1,94 @@
 /*!
-llm-pii-redact: reversible PII redaction for LLM prompts.
+llm-pii-redact: reversible PII redaction for LLM prompts and tool outputs.
 
-Replace PII (email, phone, SSN, credit card) with stable placeholders before
-sending text to an LLM, then restore the originals from the returned map.
+Replace PII (email, phone, SSN, credit card, IPs, IBAN, URL) with stable
+placeholders before sending text to an LLM, then restore the originals from
+the returned mapping.
 
 ```rust
 use llm_pii_redact::Redactor;
 
 let r = Redactor::default();
-let (redacted, map) = r.redact("Contact user@example.com for help.");
-assert!(redacted.contains("[EMAIL_0]"));
-let restored = r.restore(&redacted, &map);
-assert!(restored.contains("user@example.com"));
+let out = r.redact("Email me at ops@example.invalid or call 555-123-4567");
+// out.text    -> "Email me at <EMAIL_0> or call <PHONE_US_0>"
+// out.mapping -> { "<EMAIL_0>": "ops@example.invalid",
+//                  "<PHONE_US_0>": "555-123-4567" }
+assert!(out.text.contains("<EMAIL_0>"));
+
+let assistant_reply = format!("Confirmed: {}", "<EMAIL_0>");
+let restored = r.reveal(&assistant_reply, &out.mapping);
+assert_eq!(restored, "Confirmed: ops@example.invalid");
 ```
+
+Stable placeholders mean the LLM keeps coherent references: repeated values
+share a single placeholder, so the redacted text is deterministic.
 */
 
-use regex::Regex;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
+
+use regex::Regex;
+
+// ---- Detector kind constants ----------------------------------------------
+
+/// Email addresses, e.g. `ops@example.invalid`.
+pub const EMAIL: &str = "EMAIL";
+/// US phone numbers, e.g. `555-123-4567`, `+1 (555) 123-4567`.
+pub const PHONE_US: &str = "PHONE_US";
+/// US Social Security Numbers, e.g. `000-00-0000` or 9 contiguous digits.
+pub const SSN: &str = "SSN";
+/// Credit-card numbers (13-19 digit runs, Luhn-validated).
+pub const CREDIT_CARD: &str = "CREDIT_CARD";
+/// IPv4 addresses, e.g. `192.0.2.10`.
+pub const IP_V4: &str = "IP_V4";
+/// IPv6 addresses, e.g. `2001:db8::1`, `::1`.
+pub const IP_V6: &str = "IP_V6";
+/// IBAN account numbers, e.g. `DE89370400440532013000`.
+pub const IBAN: &str = "IBAN";
+/// HTTP/HTTPS URLs.
+pub const URL: &str = "URL";
+
+// ---- Errors ---------------------------------------------------------------
+
+/// Error returned when a custom pattern cannot be registered.
+#[derive(Debug)]
+pub enum PatternError {
+    /// The detector name was empty.
+    EmptyName,
+    /// The supplied regex failed to compile.
+    InvalidRegex(regex::Error),
+}
+
+impl fmt::Display for PatternError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PatternError::EmptyName => write!(f, "detector name must not be empty"),
+            PatternError::InvalidRegex(e) => write!(f, "invalid regex: {e}"),
+        }
+    }
+}
+
+impl Error for PatternError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            PatternError::InvalidRegex(e) => Some(e),
+            PatternError::EmptyName => None,
+        }
+    }
+}
 
 // ---- Luhn check -----------------------------------------------------------
 
+/// Validate a candidate credit-card string with the Luhn checksum.
+///
+/// Non-digit characters (spaces, dashes) are ignored. The run must contain
+/// between 13 and 19 digits.
 fn luhn_check(s: &str) -> bool {
     let digits: Vec<u32> = s
         .chars()
         .filter(|c| c.is_ascii_digit())
-        .map(|c| c.to_digit(10).unwrap())
+        .map(|c| c.to_digit(10).expect("filtered to ascii digit"))
         .collect();
     if digits.len() < 13 || digits.len() > 19 {
         return false;
@@ -42,140 +106,311 @@ fn luhn_check(s: &str) -> bool {
         sum += n;
         double = !double;
     }
-    sum % 10 == 0
+    // `% 10 == 0` is kept (rather than `is_multiple_of`) to avoid raising the
+    // crate's minimum supported Rust version.
+    #[allow(clippy::manual_is_multiple_of)]
+    {
+        sum % 10 == 0
+    }
 }
 
-// ---- PiiPattern -----------------------------------------------------------
+// ---- Detection ------------------------------------------------------------
 
-/// A named PII pattern.
+/// A single PII match found in a piece of text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detection {
+    /// The detector kind that produced this match (e.g. [`EMAIL`]).
+    pub kind: String,
+    /// The matched text (the original PII value).
+    pub value: String,
+    /// Byte offset where the match starts.
+    pub start: usize,
+    /// Byte offset where the match ends (exclusive).
+    pub end: usize,
+}
+
+// ---- Redacted -------------------------------------------------------------
+
+/// The result of [`Redactor::redact`]: redacted text plus the reverse mapping.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Redacted {
+    /// Text with every detected value replaced by a `<KIND_N>` placeholder.
+    pub text: String,
+    /// Maps each placeholder to its original value.
+    pub mapping: HashMap<String, String>,
+}
+
+// ---- Detector -------------------------------------------------------------
+
 #[derive(Debug, Clone)]
-pub struct PiiPattern {
-    pub name: String,
+struct Detector {
+    kind: String,
     regex: Regex,
-    /// If true, apply Luhn validation before treating match as PII.
     luhn: bool,
 }
 
-impl PiiPattern {
-    pub fn new(name: &str, pattern: &str) -> Self {
+impl Detector {
+    fn new(kind: &str, pattern: &str, luhn: bool) -> Self {
         Self {
-            name: name.to_owned(),
-            regex: Regex::new(pattern).expect("invalid PII regex"),
-            luhn: false,
+            kind: kind.to_owned(),
+            regex: Regex::new(pattern).expect("built-in PII regex must compile"),
+            luhn,
         }
     }
+}
 
-    pub fn with_luhn(mut self) -> Self {
-        self.luhn = true;
-        self
-    }
+// ---- Built-in patterns ----------------------------------------------------
+
+// A US phone is matched only when it carries some structural marker (a `+1`
+// prefix, parentheses, or a separator) so that bare 9/10-digit runs do not
+// shadow the SSN detector or produce false positives like `911`.
+const PHONE_PATTERN: &str =
+    r"(?:\+1[-.\s]?\d{10}\b)|(?:(?:\+1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\d{3}[-.\s])\d{3}[-.\s]?\d{4})";
+
+const EMAIL_PATTERN: &str = r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b";
+
+// Dashed SSN, or exactly nine contiguous digits.
+const SSN_PATTERN: &str = r"\b(?:\d{3}-\d{2}-\d{4}|\d{9})\b";
+
+// 13-19 digit run, optionally separated by single spaces or dashes. Luhn is
+// applied afterwards.
+const CC_PATTERN: &str = r"\b\d(?:[ -]?\d){12,18}\b";
+
+const IPV4_PATTERN: &str = r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b";
+
+// Full and compressed IPv6 forms. Most-specific alternatives first so the
+// longest valid address wins.
+const IPV6_PATTERN: &str = r"(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}|:(?::[0-9a-f]{1,4}){1,7}|(?:[0-9a-f]{1,4}:){1,7}:";
+
+// IBAN: two-letter country code, two check digits, then 11-30 alphanumerics.
+const IBAN_PATTERN: &str = r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b";
+
+const URL_PATTERN: &str = r"(?i)https?://[^\s]+";
+
+fn email_detector() -> Detector {
+    Detector::new(EMAIL, EMAIL_PATTERN, false)
+}
+fn phone_detector() -> Detector {
+    Detector::new(PHONE_US, PHONE_PATTERN, false)
+}
+fn ssn_detector() -> Detector {
+    Detector::new(SSN, SSN_PATTERN, false)
+}
+fn cc_detector() -> Detector {
+    Detector::new(CREDIT_CARD, CC_PATTERN, true)
+}
+fn ipv4_detector() -> Detector {
+    Detector::new(IP_V4, IPV4_PATTERN, false)
+}
+fn ipv6_detector() -> Detector {
+    Detector::new(IP_V6, IPV6_PATTERN, false)
+}
+fn iban_detector() -> Detector {
+    Detector::new(IBAN, IBAN_PATTERN, false)
+}
+fn url_detector() -> Detector {
+    Detector::new(URL, URL_PATTERN, false)
 }
 
 // ---- Redactor -------------------------------------------------------------
 
-/// Redacts PII from text and provides reversible restoration.
+/// Detects PII in text and redacts it to reversible placeholders.
+#[derive(Debug, Clone)]
 pub struct Redactor {
-    patterns: Vec<PiiPattern>,
-    /// Optional hook: `custom_patterns` added on top of built-ins.
-    extra: Vec<PiiPattern>,
+    detectors: Vec<Detector>,
 }
 
+/// The default redactor registers all built-in detectors, in this order:
+/// email, phone, SSN, credit card, IPv4, IPv6, IBAN, URL.
 impl Default for Redactor {
     fn default() -> Self {
         Self {
-            patterns: builtin_patterns(),
-            extra: Vec::new(),
+            detectors: vec![
+                email_detector(),
+                phone_detector(),
+                ssn_detector(),
+                cc_detector(),
+                ipv4_detector(),
+                ipv6_detector(),
+                iban_detector(),
+                url_detector(),
+            ],
         }
     }
 }
 
 impl Redactor {
-    /// Create with only the built-in patterns.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add a custom pattern (appended after built-ins).
-    pub fn with_pattern(mut self, p: PiiPattern) -> Self {
-        self.extra.push(p);
-        self
-    }
-
-    fn all_patterns(&self) -> impl Iterator<Item = &PiiPattern> {
-        self.patterns.iter().chain(self.extra.iter())
-    }
-
-    /// Redact PII from `text`. Returns `(redacted_text, restore_map)`.
+    /// Create an empty redactor with no detectors registered.
     ///
-    /// The restore map maps placeholder → original value.
-    pub fn redact(&self, text: &str) -> (String, HashMap<String, String>) {
-        let mut result = text.to_owned();
-        let mut map: HashMap<String, String> = HashMap::new();
-        // Counter per pattern name.
-        let mut counters: HashMap<String, usize> = HashMap::new();
+    /// Use [`Redactor::default`] for the full built-in set, or chain
+    /// [`Redactor::with_pattern`] to add custom detectors.
+    pub fn new() -> Self {
+        Self {
+            detectors: Vec::new(),
+        }
+    }
 
-        for pat in self.all_patterns() {
-            let mut new_result = String::new();
-            let mut last_end = 0;
-            for m in pat.regex.find_iter(&result) {
-                let matched = m.as_str();
-                // For credit cards, run Luhn check.
-                if pat.luhn && !luhn_check(matched) {
-                    new_result.push_str(&result[last_end..m.end()]);
-                    last_end = m.end();
+    /// A redactor with only the email detector.
+    pub fn email() -> Self {
+        Self {
+            detectors: vec![email_detector()],
+        }
+    }
+
+    /// A redactor with only the US phone detector.
+    pub fn phone() -> Self {
+        Self {
+            detectors: vec![phone_detector()],
+        }
+    }
+
+    /// A redactor with only the SSN detector.
+    pub fn ssn() -> Self {
+        Self {
+            detectors: vec![ssn_detector()],
+        }
+    }
+
+    /// A redactor with only the credit-card detector.
+    pub fn cc() -> Self {
+        Self {
+            detectors: vec![cc_detector()],
+        }
+    }
+
+    /// A redactor with only the IPv4 and IPv6 detectors.
+    pub fn ip() -> Self {
+        Self {
+            detectors: vec![ipv4_detector(), ipv6_detector()],
+        }
+    }
+
+    /// Register a custom detector.
+    ///
+    /// Returns an error if `name` is empty or `pattern` is not a valid regex.
+    pub fn with_pattern(mut self, name: &str, pattern: &str) -> Result<Self, PatternError> {
+        if name.is_empty() {
+            return Err(PatternError::EmptyName);
+        }
+        let regex = Regex::new(pattern).map_err(PatternError::InvalidRegex)?;
+        self.detectors.push(Detector {
+            kind: name.to_owned(),
+            regex,
+            luhn: false,
+        });
+        Ok(self)
+    }
+
+    /// The names of the registered detectors, in registration order.
+    pub fn detector_names(&self) -> Vec<&str> {
+        self.detectors.iter().map(|d| d.kind.as_str()).collect()
+    }
+
+    /// Find every PII match in `text`.
+    ///
+    /// Matches are returned in document order and never overlap: where two
+    /// detectors match the same region, the leftmost-longest match wins
+    /// (ties broken by detector registration order).
+    pub fn detect(&self, text: &str) -> Vec<Detection> {
+        // Collect every candidate, tagged with its detector index for
+        // deterministic tie-breaking.
+        let mut candidates: Vec<(usize, Detection)> = Vec::new();
+        for (idx, det) in self.detectors.iter().enumerate() {
+            for m in det.regex.find_iter(text) {
+                if det.luhn && !luhn_check(m.as_str()) {
                     continue;
                 }
-                let idx = counters.entry(pat.name.clone()).or_insert(0);
-                let placeholder = format!("[{}_{}]", pat.name.to_uppercase(), idx);
-                *idx += 1;
-                map.insert(placeholder.clone(), matched.to_owned());
-                new_result.push_str(&result[last_end..m.start()]);
-                new_result.push_str(&placeholder);
-                last_end = m.end();
+                candidates.push((
+                    idx,
+                    Detection {
+                        kind: det.kind.clone(),
+                        value: m.as_str().to_owned(),
+                        start: m.start(),
+                        end: m.end(),
+                    },
+                ));
             }
-            new_result.push_str(&result[last_end..]);
-            result = new_result;
         }
 
-        (result, map)
+        // Leftmost-longest, then earliest detector index.
+        candidates.sort_by(|a, b| {
+            a.1.start
+                .cmp(&b.1.start)
+                .then(b.1.end.cmp(&a.1.end))
+                .then(a.0.cmp(&b.0))
+        });
+
+        let mut chosen: Vec<Detection> = Vec::new();
+        let mut covered_to = 0usize;
+        for (_, det) in candidates {
+            if det.start >= covered_to {
+                covered_to = det.end;
+                chosen.push(det);
+            }
+        }
+        chosen
     }
 
-    /// Restore placeholders in `text` using the map from `redact()`.
-    pub fn restore(&self, text: &str, map: &HashMap<String, String>) -> String {
+    /// Redact `text`, returning the placeholder-substituted text and the
+    /// reverse mapping.
+    ///
+    /// Identical values share a single placeholder, so the output is
+    /// deterministic and the LLM can refer to the same entity consistently.
+    pub fn redact(&self, text: &str) -> Redacted {
+        let detections = self.detect(text);
+
+        let mut mapping: HashMap<String, String> = HashMap::new();
+        // value -> placeholder, so repeated values reuse one placeholder.
+        let mut value_to_placeholder: HashMap<String, String> = HashMap::new();
+        // per-kind running index.
+        let mut counters: HashMap<String, usize> = HashMap::new();
+
+        let mut out = String::with_capacity(text.len());
+        let mut last_end = 0usize;
+        for det in &detections {
+            out.push_str(&text[last_end..det.start]);
+
+            let placeholder = value_to_placeholder
+                .entry(det.value.clone())
+                .or_insert_with(|| {
+                    let idx = counters.entry(det.kind.clone()).or_insert(0);
+                    let ph = format!("<{}_{}>", det.kind, *idx);
+                    *idx += 1;
+                    mapping.insert(ph.clone(), det.value.clone());
+                    ph
+                })
+                .clone();
+
+            out.push_str(&placeholder);
+            last_end = det.end;
+        }
+        out.push_str(&text[last_end..]);
+
+        Redacted { text: out, mapping }
+    }
+
+    /// Restore placeholders in `text` using a mapping from [`Redactor::redact`].
+    ///
+    /// Unknown placeholders are left untouched. Longer placeholders are
+    /// substituted first so that `<EMAIL_1>` does not corrupt `<EMAIL_10>`.
+    pub fn reveal(&self, text: &str, mapping: &HashMap<String, String>) -> String {
+        let mut keys: Vec<&String> = mapping.keys().collect();
+        keys.sort_by(|a, b| b.len().cmp(&a.len()).then(a.as_str().cmp(b.as_str())));
+
         let mut result = text.to_owned();
-        for (placeholder, original) in map {
-            result = result.replace(placeholder.as_str(), original.as_str());
+        for key in keys {
+            if let Some(original) = mapping.get(key) {
+                result = result.replace(key.as_str(), original.as_str());
+            }
         }
         result
     }
 }
 
-fn builtin_patterns() -> Vec<PiiPattern> {
-    vec![
-        // Credit card (Luhn-validated).
-        PiiPattern::new(
-            "cc",
-            r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b",
-        )
-        .with_luhn(),
-        // Email.
-        PiiPattern::new(
-            "email",
-            r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b",
-        ),
-        // US SSN.
-        PiiPattern::new("ssn", r"\b\d{3}-\d{2}-\d{4}\b"),
-        // US phone.
-        PiiPattern::new(
-            "phone",
-            r"\b(?:\+1\s?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b",
-        ),
-    ]
-}
-
-/// Return the built-in PII pattern names.
-pub fn builtin_pattern_names() -> Vec<&'static str> {
-    vec!["cc", "email", "ssn", "phone"]
+/// Return the built-in detector kind names in registration order.
+pub fn builtin_detector_names() -> Vec<&'static str> {
+    vec![EMAIL, PHONE_US, SSN, CREDIT_CARD, IP_V4, IP_V6, IBAN, URL]
 }
 
 #[cfg(test)]
@@ -183,124 +418,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn email_redacted() {
-        let r = Redactor::new();
-        let (out, map) = r.redact("send to user@example.com please");
-        assert!(out.contains("[EMAIL_0]"));
-        assert!(!out.contains("user@example.com"));
-        assert_eq!(map["[EMAIL_0]"], "user@example.com");
+    fn luhn_accepts_known_test_numbers() {
+        assert!(luhn_check("4111111111111111")); // Visa
+        assert!(luhn_check("5500005555555559")); // Mastercard
+        assert!(luhn_check("378282246310005")); // Amex (15)
     }
 
     #[test]
-    fn email_restored() {
-        let r = Redactor::new();
-        let (redacted, map) = r.redact("email: user@example.com");
-        let restored = r.restore(&redacted, &map);
-        assert!(restored.contains("user@example.com"));
-    }
-
-    #[test]
-    fn ssn_redacted() {
-        let r = Redactor::new();
-        let (out, _) = r.redact("SSN: 123-45-6789");
-        assert!(out.contains("[SSN_0]"));
-        assert!(!out.contains("123-45-6789"));
-    }
-
-    #[test]
-    fn phone_redacted() {
-        let r = Redactor::new();
-        let (out, _) = r.redact("call 555-867-5309 now");
-        assert!(out.contains("[PHONE_0]"));
-    }
-
-    #[test]
-    fn no_pii_unchanged() {
-        let r = Redactor::new();
-        let text = "The sky is blue and 42 is the answer.";
-        let (out, map) = r.redact(text);
-        assert_eq!(out, text);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn multiple_emails_indexed() {
-        let r = Redactor::new();
-        let (out, map) = r.redact("a@a.com and b@b.com");
-        assert!(out.contains("[EMAIL_0]"));
-        assert!(out.contains("[EMAIL_1]"));
-        assert_eq!(map.len(), 2);
-    }
-
-    #[test]
-    fn restore_multiple() {
-        let r = Redactor::new();
-        let (redacted, map) = r.redact("a@a.com and b@b.com");
-        let restored = r.restore(&redacted, &map);
-        assert!(restored.contains("a@a.com"));
-        assert!(restored.contains("b@b.com"));
-    }
-
-    #[test]
-    fn luhn_valid_cc_redacted() {
-        // Known valid Visa test number
-        let r = Redactor::new();
-        let (out, map) = r.redact("card: 4111111111111111");
-        assert!(out.contains("[CC_0]"));
-        assert_eq!(map["[CC_0]"], "4111111111111111");
-    }
-
-    #[test]
-    fn luhn_invalid_number_not_redacted() {
-        let r = Redactor::new();
-        // Same length as a Visa but Luhn fails
-        let (out, _) = r.redact("4111111111111112");
-        assert!(!out.contains("[CC_0]"));
-    }
-
-    #[test]
-    fn luhn_check_valid() {
-        assert!(luhn_check("4111111111111111")); // Visa test
-        assert!(luhn_check("5500005555555559")); // Mastercard test
-    }
-
-    #[test]
-    fn luhn_check_invalid() {
+    fn luhn_rejects_bad_or_short() {
         assert!(!luhn_check("4111111111111112"));
         assert!(!luhn_check("1234567890123456"));
-    }
-
-    #[test]
-    fn luhn_check_too_short() {
         assert!(!luhn_check("123"));
     }
 
     #[test]
-    fn custom_pattern_added() {
-        let custom = PiiPattern::new("zip", r"\b\d{5}(?:-\d{4})?\b");
-        let r = Redactor::new().with_pattern(custom);
-        let (out, map) = r.redact("zip code 12345 here");
-        assert!(map.values().any(|v| v == "12345"), "map={:?} out={}", map, out);
+    fn default_registers_all_detectors() {
+        let r = Redactor::default();
+        assert_eq!(r.detector_names(), builtin_detector_names());
     }
 
     #[test]
-    fn builtin_pattern_names_non_empty() {
-        assert!(!builtin_pattern_names().is_empty());
-    }
-
-    #[test]
-    fn empty_text() {
+    fn new_is_empty() {
         let r = Redactor::new();
-        let (out, map) = r.redact("");
-        assert_eq!(out, "");
-        assert!(map.is_empty());
+        assert!(r.detector_names().is_empty());
     }
 
     #[test]
-    fn restore_no_placeholders_unchanged() {
-        let r = Redactor::new();
-        let map = HashMap::new();
-        let text = "plain text no placeholders";
-        assert_eq!(r.restore(text, &map), text);
+    fn redact_round_trips() {
+        let r = Redactor::default();
+        let src = "reach me at a@b.invalid or 555-123-4567";
+        let out = r.redact(src);
+        assert!(!out.text.contains("a@b.invalid"));
+        assert_eq!(r.reveal(&out.text, &out.mapping), src);
+    }
+
+    #[test]
+    fn repeated_value_shares_one_placeholder() {
+        let r = Redactor::email();
+        let out = r.redact("a@b.invalid and a@b.invalid");
+        assert_eq!(out.mapping.len(), 1);
+        assert_eq!(out.text.matches("<EMAIL_0>").count(), 2);
+    }
+
+    #[test]
+    fn with_pattern_rejects_empty_name_and_bad_regex() {
+        assert!(Redactor::new().with_pattern("", r".+").is_err());
+        assert!(Redactor::new().with_pattern("X", "(").is_err());
+        assert!(Redactor::new().with_pattern("X", r"\d+").is_ok());
     }
 }

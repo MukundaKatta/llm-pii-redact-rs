@@ -10,9 +10,7 @@
 
 use std::collections::HashMap;
 
-use llm_pii_redact::{
-    Redactor, CREDIT_CARD, EMAIL, IBAN, IP_V4, IP_V6, PHONE_US, SSN, URL,
-};
+use llm_pii_redact::{Redactor, CREDIT_CARD, EMAIL, IBAN, IP_V4, IP_V6, PHONE_US, SSN, URL};
 
 // -- Email --------------------------------------------------------------------
 
@@ -74,7 +72,10 @@ fn phone_miss_on_short_number() {
 fn ssn_dashed_hit() {
     let r = Redactor::default();
     let dets = r.detect("SSN 000-00-0000");
-    let pairs: Vec<(String, String)> = dets.iter().map(|d| (d.kind.clone(), d.value.clone())).collect();
+    let pairs: Vec<(String, String)> = dets
+        .iter()
+        .map(|d| (d.kind.clone(), d.value.clone()))
+        .collect();
     assert_eq!(pairs, vec![(SSN.to_string(), "000-00-0000".to_string())]);
 }
 
@@ -82,9 +83,7 @@ fn ssn_dashed_hit() {
 fn ssn_nine_digit_hit() {
     let r = Redactor::default();
     let dets = r.detect("SSN 000000000 maybe");
-    assert!(dets
-        .iter()
-        .any(|d| d.kind == SSN && d.value == "000000000"));
+    assert!(dets.iter().any(|d| d.kind == SSN && d.value == "000000000"));
 }
 
 #[test]
@@ -224,10 +223,16 @@ fn distinct_values_get_distinct_placeholders() {
     let r = Redactor::default();
     let out = r.redact("a@b.invalid and c@d.invalid");
     let values: std::collections::HashSet<String> = out.mapping.values().cloned().collect();
-    let expected_values: std::collections::HashSet<String> = ["a@b.invalid".to_string(), "c@d.invalid".to_string()].into_iter().collect();
+    let expected_values: std::collections::HashSet<String> =
+        ["a@b.invalid".to_string(), "c@d.invalid".to_string()]
+            .into_iter()
+            .collect();
     assert_eq!(values, expected_values);
     let keys: std::collections::HashSet<String> = out.mapping.keys().cloned().collect();
-    let expected_keys: std::collections::HashSet<String> = ["<EMAIL_0>".to_string(), "<EMAIL_1>".to_string()].into_iter().collect();
+    let expected_keys: std::collections::HashSet<String> =
+        ["<EMAIL_0>".to_string(), "<EMAIL_1>".to_string()]
+            .into_iter()
+            .collect();
     assert_eq!(keys, expected_keys);
 }
 
@@ -268,10 +273,7 @@ fn reveal_does_not_confuse_index_prefixes() {
     let mut mapping: HashMap<String, String> = HashMap::new();
     mapping.insert("<EMAIL_1>".to_string(), "one@x.invalid".to_string());
     mapping.insert("<EMAIL_10>".to_string(), "ten@x.invalid".to_string());
-    assert_eq!(
-        r.reveal(text, &mapping),
-        "ten@x.invalid and one@x.invalid"
-    );
+    assert_eq!(r.reveal(text, &mapping), "ten@x.invalid and one@x.invalid");
 }
 
 #[test]
@@ -290,10 +292,7 @@ fn custom_pattern_detected_and_redacted() {
         .expect("regex compiles");
     let out = r.redact("key=AKIAABCDEFGHIJKLMNOP ok");
     assert!(out.text.contains("<AWS_ACCESS_KEY_0>"));
-    assert_eq!(
-        out.mapping["<AWS_ACCESS_KEY_0>"],
-        "AKIAABCDEFGHIJKLMNOP"
-    );
+    assert_eq!(out.mapping["<AWS_ACCESS_KEY_0>"], "AKIAABCDEFGHIJKLMNOP");
 }
 
 #[test]
@@ -318,7 +317,8 @@ fn email_helper_leaves_phone_untouched() {
     assert!(out.text.contains("555-123-4567"));
     assert!(out.text.contains("<EMAIL_0>"));
     let values: std::collections::HashSet<String> = out.mapping.values().cloned().collect();
-    let expected: std::collections::HashSet<String> = ["a@b.invalid".to_string()].into_iter().collect();
+    let expected: std::collections::HashSet<String> =
+        ["a@b.invalid".to_string()].into_iter().collect();
     assert_eq!(values, expected);
 }
 
@@ -392,10 +392,7 @@ fn overlapping_matches_handled_deterministically() {
     let r = Redactor::default();
     let src = "visit https://site.invalid/path";
     let out = r.redact(src);
-    assert_eq!(
-        out.mapping.keys().filter(|k| k.starts_with('<')).count(),
-        1
-    );
+    assert_eq!(out.mapping.keys().filter(|k| k.starts_with('<')).count(), 1);
 }
 
 #[test]

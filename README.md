@@ -109,6 +109,53 @@ let real_reply = r.reveal(&assistant_reply, &red.mapping);
 assert_eq!(real_reply, "Confirmed: ops@example.invalid");
 ```
 
+### Consistent placeholders across a conversation
+
+Each `redact` call is independent: counters restart at `0`, so the same value can
+get `<EMAIL_0>` in two unrelated calls, and `reveal` needs the mapping from the
+matching call. For a multi-turn conversation you usually want one value to keep
+the *same* placeholder across every message and one mapping that reveals values
+from any turn. That is what a `Session` provides:
+
+```rust
+use llm_pii_redact::Redactor;
+
+let mut session = Redactor::default().session();
+
+let prompt   = session.redact("Email a@b.invalid and c@d.invalid");
+let followup = session.redact("Resend to a@b.invalid only");
+
+// a@b.invalid keeps <EMAIL_0> in both messages; c@d.invalid is <EMAIL_1>.
+assert!(prompt.contains("<EMAIL_0>"));
+assert!(followup.contains("<EMAIL_0>"));   // reused, not renumbered
+assert!(!followup.contains("<EMAIL_1>"));
+
+// One accumulated mapping reveals placeholders from either turn.
+assert_eq!(session.reveal("ok <EMAIL_1>"), "ok c@d.invalid");
+```
+
+`session.mapping()` exposes the accumulated placeholder-to-value map, and
+`session.into_redactor()` hands back the underlying stateless `Redactor`.
+
+## API
+
+| Item | What it is |
+|---|---|
+| `Redactor::default()` | Redactor with all built-in detectors (email, phone, SSN, card, IPv4, IPv6, IBAN, URL). |
+| `Redactor::new()` | Empty redactor; add detectors with `with_pattern`. |
+| `Redactor::email()` / `phone()` / `ssn()` / `cc()` / `ip()` | Single-purpose redactors. |
+| `Redactor::with_pattern(name, regex)` | Register a custom detector; errors on empty name or bad regex. |
+| `Redactor::detect(text) -> Vec<Detection>` | Non-overlapping matches in document order. |
+| `Redactor::redact(text) -> Redacted` | Stateless redaction: `{ text, mapping }`. |
+| `Redactor::reveal(text, &mapping) -> String` | Restore originals from a mapping. |
+| `Redactor::session() -> Session` | Stateful redactor that keeps placeholders consistent across calls. |
+| `Session::redact(text) -> String` | Redact reusing placeholders from earlier calls. |
+| `Session::reveal(text) -> String` | Restore using the session's accumulated mapping. |
+| `Session::mapping() -> &HashMap` | The accumulated placeholder-to-value map. |
+| `Redacted` | `{ text: String, mapping: HashMap<String, String> }`; `Serialize`/`Deserialize` under the `serde` feature. |
+| `Detection` | `{ kind, value, start, end }` for one match. |
+| `builtin_detector_names()` | The built-in kind names in registration order. |
+
 ## What it does NOT do
 
 - No name / address / DOB classifier. Regex only.

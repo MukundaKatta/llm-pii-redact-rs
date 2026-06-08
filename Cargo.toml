@@ -2,6 +2,7 @@
 name = "llm-pii-redact"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.65"
 description = "Reversible PII redaction for LLM prompts"
 license = "MIT"
 repository = "https://github.com/MukundaKatta/llm-pii-redact-rs"
@@ -13,6 +14,13 @@ exclude = ["target/*", ".github/*", "*.log"]
 regex = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 
+[dev-dependencies]
+serde_json = "1"
+
 [features]
 default = []
 serde = ["dep:serde"]
+
+[package.metadata.docs.rs]
+# Build docs on docs.rs with all features so `Redacted`'s serde impls show up.
+all-features = true

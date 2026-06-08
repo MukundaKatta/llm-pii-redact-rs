@@ -22,6 +22,10 @@ assert_eq!(restored, "Confirmed: ops@example.invalid");
 
 Stable placeholders mean the LLM keeps coherent references: repeated values
 share a single placeholder, so the redacted text is deterministic.
+
+For a multi-turn conversation where a value must keep the *same* placeholder
+across several messages, use a [`Session`] (via [`Redactor::session`]), which
+accumulates one placeholder mapping across every call.
 */
 
 use std::collections::HashMap;
@@ -139,6 +143,41 @@ pub struct Redacted {
     pub text: String,
     /// Maps each placeholder to its original value.
     pub mapping: HashMap<String, String>,
+}
+
+// ---- Placeholder allocation ------------------------------------------------
+
+/// Mutable bookkeeping for allocating stable `<KIND_N>` placeholders.
+///
+/// Shared by [`Redactor::redact`] (a fresh state per call) and [`Session`]
+/// (one state reused across many calls), so the allocation rules — one
+/// placeholder per distinct value, per-kind counters starting at `0` — are
+/// defined in exactly one place.
+#[derive(Debug, Clone, Default)]
+struct PlaceholderState {
+    /// Maps each placeholder to its original value (the reverse mapping).
+    mapping: HashMap<String, String>,
+    /// Maps each seen value to the placeholder already assigned to it.
+    value_to_placeholder: HashMap<String, String>,
+    /// Per-kind running index used to number new placeholders.
+    counters: HashMap<String, usize>,
+}
+
+impl PlaceholderState {
+    /// Return the placeholder for `(kind, value)`, allocating a new one on the
+    /// first sight of `value` and reusing it on every subsequent sight.
+    fn placeholder_for(&mut self, kind: &str, value: &str) -> String {
+        if let Some(existing) = self.value_to_placeholder.get(value) {
+            return existing.clone();
+        }
+        let idx = self.counters.entry(kind.to_owned()).or_insert(0);
+        let ph = format!("<{kind}_{idx}>");
+        *idx += 1;
+        self.mapping.insert(ph.clone(), value.to_owned());
+        self.value_to_placeholder
+            .insert(value.to_owned(), ph.clone());
+        ph
+    }
 }
 
 // ---- Detector -------------------------------------------------------------
@@ -357,37 +396,37 @@ impl Redactor {
     ///
     /// Identical values share a single placeholder, so the output is
     /// deterministic and the LLM can refer to the same entity consistently.
+    ///
+    /// Each call is independent: placeholder counters start from `0`. To keep
+    /// placeholders consistent across several pieces of text (for example a
+    /// prompt and a later follow-up message), use a [`Session`] instead.
     pub fn redact(&self, text: &str) -> Redacted {
-        let detections = self.detect(text);
+        let mut state = PlaceholderState::default();
+        let out = self.redact_into(text, &mut state);
+        Redacted {
+            text: out,
+            mapping: state.mapping,
+        }
+    }
 
-        let mut mapping: HashMap<String, String> = HashMap::new();
-        // value -> placeholder, so repeated values reuse one placeholder.
-        let mut value_to_placeholder: HashMap<String, String> = HashMap::new();
-        // per-kind running index.
-        let mut counters: HashMap<String, usize> = HashMap::new();
+    /// Redact `text` against the shared placeholder `state`, returning only the
+    /// substituted text. `state` accumulates the value-to-placeholder mapping
+    /// and per-kind counters, so repeated values across calls reuse the same
+    /// placeholder. This is the shared core of [`Redactor::redact`] and
+    /// [`Session::redact`].
+    fn redact_into(&self, text: &str, state: &mut PlaceholderState) -> String {
+        let detections = self.detect(text);
 
         let mut out = String::with_capacity(text.len());
         let mut last_end = 0usize;
         for det in &detections {
             out.push_str(&text[last_end..det.start]);
-
-            let placeholder = value_to_placeholder
-                .entry(det.value.clone())
-                .or_insert_with(|| {
-                    let idx = counters.entry(det.kind.clone()).or_insert(0);
-                    let ph = format!("<{}_{}>", det.kind, *idx);
-                    *idx += 1;
-                    mapping.insert(ph.clone(), det.value.clone());
-                    ph
-                })
-                .clone();
-
+            let placeholder = state.placeholder_for(&det.kind, &det.value);
             out.push_str(&placeholder);
             last_end = det.end;
         }
         out.push_str(&text[last_end..]);
-
-        Redacted { text: out, mapping }
+        out
     }
 
     /// Restore placeholders in `text` using a mapping from [`Redactor::redact`].
@@ -395,16 +434,108 @@ impl Redactor {
     /// Unknown placeholders are left untouched. Longer placeholders are
     /// substituted first so that `<EMAIL_1>` does not corrupt `<EMAIL_10>`.
     pub fn reveal(&self, text: &str, mapping: &HashMap<String, String>) -> String {
-        let mut keys: Vec<&String> = mapping.keys().collect();
-        keys.sort_by(|a, b| b.len().cmp(&a.len()).then(a.as_str().cmp(b.as_str())));
+        reveal_with(text, mapping)
+    }
 
-        let mut result = text.to_owned();
-        for key in keys {
-            if let Some(original) = mapping.get(key) {
-                result = result.replace(key.as_str(), original.as_str());
-            }
+    /// Start a stateful [`Session`] that keeps placeholders consistent across
+    /// several [`Session::redact`] calls.
+    ///
+    /// ```
+    /// use llm_pii_redact::Redactor;
+    ///
+    /// let mut session = Redactor::default().session();
+    /// let first = session.redact("contact a@b.invalid");
+    /// // The same value seen again reuses the original placeholder, even
+    /// // though this is a separate call.
+    /// let second = session.redact("again, a@b.invalid");
+    /// assert!(first.contains("<EMAIL_0>"));
+    /// assert!(second.contains("<EMAIL_0>"));
+    /// ```
+    pub fn session(self) -> Session {
+        Session {
+            redactor: self,
+            state: PlaceholderState::default(),
         }
-        result
+    }
+}
+
+/// Restore placeholders in `text` using `mapping`.
+///
+/// Unknown placeholders are left untouched. Longer placeholders are
+/// substituted first so that `<EMAIL_1>` does not corrupt `<EMAIL_10>`.
+fn reveal_with(text: &str, mapping: &HashMap<String, String>) -> String {
+    let mut keys: Vec<&String> = mapping.keys().collect();
+    keys.sort_by(|a, b| b.len().cmp(&a.len()).then(a.as_str().cmp(b.as_str())));
+
+    let mut result = text.to_owned();
+    for key in keys {
+        if let Some(original) = mapping.get(key) {
+            result = result.replace(key.as_str(), original.as_str());
+        }
+    }
+    result
+}
+
+// ---- Session --------------------------------------------------------------
+
+/// A stateful redactor that keeps placeholders consistent across calls.
+///
+/// A bare [`Redactor`] numbers placeholders from `0` on every [`Redactor::redact`]
+/// call, so the same value can map to `<EMAIL_0>` in one call and `<EMAIL_0>`
+/// again — but two *different* texts processed separately have no shared
+/// numbering, and `reveal` needs the mapping from the matching call.
+///
+/// A `Session` solves the multi-message case: it accumulates one mapping across
+/// every [`Session::redact`] call, so a value that appeared in an earlier
+/// message reuses the placeholder it was first assigned, and a single
+/// [`Session::reveal`] (or the accumulated [`Session::mapping`]) restores values
+/// from *any* of the redacted messages.
+///
+/// ```
+/// use llm_pii_redact::Redactor;
+///
+/// let mut session = Redactor::default().session();
+/// let prompt = session.redact("Email a@b.invalid and c@d.invalid");
+/// let followup = session.redact("Resend to a@b.invalid only");
+///
+/// // a@b.invalid keeps <EMAIL_0> in both messages.
+/// assert!(prompt.contains("<EMAIL_0>"));
+/// assert!(followup.contains("<EMAIL_0>"));
+/// assert!(!followup.contains("<EMAIL_1>"));
+///
+/// // One mapping reveals placeholders from either message.
+/// assert_eq!(session.reveal("ok <EMAIL_1>"), "ok c@d.invalid");
+/// ```
+#[derive(Debug, Clone)]
+pub struct Session {
+    redactor: Redactor,
+    state: PlaceholderState,
+}
+
+impl Session {
+    /// Redact `text`, reusing placeholders already assigned in this session and
+    /// allocating new ones for values seen for the first time.
+    pub fn redact(&mut self, text: &str) -> String {
+        self.redactor.redact_into(text, &mut self.state)
+    }
+
+    /// The accumulated placeholder-to-value mapping for every value redacted in
+    /// this session so far.
+    pub fn mapping(&self) -> &HashMap<String, String> {
+        &self.state.mapping
+    }
+
+    /// Restore placeholders in `text` using the session's accumulated mapping.
+    ///
+    /// Because the mapping spans every [`Session::redact`] call, this restores
+    /// values that were redacted in any earlier message of the session.
+    pub fn reveal(&self, text: &str) -> String {
+        reveal_with(text, &self.state.mapping)
+    }
+
+    /// Consume the session and return the underlying [`Redactor`].
+    pub fn into_redactor(self) -> Redactor {
+        self.redactor
     }
 }
 
@@ -465,5 +596,66 @@ mod tests {
         assert!(Redactor::new().with_pattern("", r".+").is_err());
         assert!(Redactor::new().with_pattern("X", "(").is_err());
         assert!(Redactor::new().with_pattern("X", r"\d+").is_ok());
+    }
+
+    #[test]
+    fn session_reuses_placeholder_across_calls() {
+        let mut s = Redactor::email().session();
+        let first = s.redact("ping a@b.invalid");
+        let second = s.redact("ping a@b.invalid again");
+        assert!(first.contains("<EMAIL_0>"));
+        assert!(second.contains("<EMAIL_0>"));
+        // Only one mapping entry, shared across both messages.
+        assert_eq!(s.mapping().len(), 1);
+    }
+
+    #[test]
+    fn session_numbers_new_values_continuing_from_prior_calls() {
+        let mut s = Redactor::email().session();
+        let _ = s.redact("a@b.invalid");
+        let second = s.redact("now c@d.invalid");
+        // The second distinct value continues the counter rather than resetting.
+        assert!(second.contains("<EMAIL_1>"));
+        assert_eq!(s.mapping().len(), 2);
+    }
+
+    #[test]
+    fn session_reveal_spans_all_calls() {
+        let mut s = Redactor::default().session();
+        let _ = s.redact("Email a@b.invalid and c@d.invalid");
+        let _ = s.redact("Resend to a@b.invalid only");
+        // A single reveal restores values first seen in different calls.
+        assert_eq!(
+            s.reveal("<EMAIL_0> and <EMAIL_1>"),
+            "a@b.invalid and c@d.invalid"
+        );
+    }
+
+    #[test]
+    fn session_into_redactor_round_trips() {
+        let r = Redactor::email();
+        let names = r
+            .detector_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let s = r.session();
+        let back = s.into_redactor();
+        let back_names = back
+            .detector_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, back_names);
+    }
+
+    #[test]
+    fn plain_redact_still_resets_per_call() {
+        // The stateless API must be unchanged: each call starts at index 0.
+        let r = Redactor::email();
+        let a = r.redact("a@b.invalid");
+        let b = r.redact("c@d.invalid");
+        assert!(a.text.contains("<EMAIL_0>"));
+        assert!(b.text.contains("<EMAIL_0>"));
     }
 }

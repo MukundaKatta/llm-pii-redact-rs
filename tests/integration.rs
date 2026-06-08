@@ -422,3 +422,87 @@ fn redacted_is_default_constructible() {
     assert!(r.text.is_empty());
     assert!(r.mapping.is_empty());
 }
+
+// -- Session: cross-call consistent redaction --------------------------------
+
+#[test]
+fn session_keeps_same_value_on_same_placeholder() {
+    let mut s = Redactor::default().session();
+    let prompt = s.redact("Email a@b.invalid and c@d.invalid");
+    let followup = s.redact("Resend to a@b.invalid only");
+
+    // a@b.invalid was assigned <EMAIL_0> first; the follow-up reuses it.
+    assert!(prompt.contains("<EMAIL_0>"));
+    assert!(prompt.contains("<EMAIL_1>"));
+    assert!(followup.contains("<EMAIL_0>"));
+    assert!(!followup.contains("<EMAIL_1>"));
+}
+
+#[test]
+fn session_mapping_accumulates_across_calls() {
+    let mut s = Redactor::default().session();
+    let _ = s.redact("a@b.invalid call 555-123-4567");
+    let _ = s.redact("also c@d.invalid");
+
+    let mapping = s.mapping();
+    let values: std::collections::HashSet<&str> = mapping.values().map(|v| v.as_str()).collect();
+    assert!(values.contains("a@b.invalid"));
+    assert!(values.contains("c@d.invalid"));
+    assert!(values.contains("555-123-4567"));
+    assert_eq!(mapping.len(), 3);
+}
+
+#[test]
+fn session_reveal_restores_from_any_message() {
+    let mut s = Redactor::default().session();
+    let _ = s.redact("first a@b.invalid");
+    let _ = s.redact("second c@d.invalid");
+
+    // An assistant reply can reference placeholders introduced in either turn.
+    let restored = s.reveal("got <EMAIL_0> and <EMAIL_1>");
+    assert_eq!(restored, "got a@b.invalid and c@d.invalid");
+}
+
+#[test]
+fn session_independent_from_plain_redact() {
+    // Two plain redact calls each reset to index 0...
+    let r = Redactor::email();
+    assert!(r.redact("a@b.invalid").text.contains("<EMAIL_0>"));
+    assert!(r.redact("c@d.invalid").text.contains("<EMAIL_0>"));
+
+    // ...whereas a session continues numbering.
+    let mut s = Redactor::email().session();
+    assert!(s.redact("a@b.invalid").contains("<EMAIL_0>"));
+    assert!(s.redact("c@d.invalid").contains("<EMAIL_1>"));
+}
+
+#[test]
+fn session_into_redactor_preserves_detectors() {
+    let s = Redactor::default().session();
+    let back = s.into_redactor();
+    assert_eq!(
+        back.detector_names(),
+        vec![EMAIL, PHONE_US, SSN, CREDIT_CARD, IP_V4, IP_V6, IBAN, URL]
+    );
+}
+
+// -- serde round trip (feature-gated) ----------------------------------------
+
+#[cfg(feature = "serde")]
+#[test]
+fn redacted_serde_json_round_trip() {
+    // With the `serde` feature, `Redacted` survives a JSON round trip so it can
+    // be persisted between the redact and reveal steps of an LLM call.
+    let r = Redactor::default();
+    let out = r.redact("Email me at a@b.invalid or call 555-123-4567");
+
+    let json = serde_json::to_string(&out).expect("serialize");
+    let back: llm_pii_redact::Redacted = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(back.text, out.text);
+    assert_eq!(back.mapping, out.mapping);
+    assert_eq!(
+        r.reveal(&back.text, &back.mapping),
+        "Email me at a@b.invalid or call 555-123-4567"
+    );
+}
